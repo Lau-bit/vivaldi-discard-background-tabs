@@ -11,6 +11,8 @@ const PARKED_PAGE = chrome.runtime.getURL("parked.html");
 const PARKED_STATE_KEY = "parkedState";
 const SMART_TOGGLE_MENU_ID = "discard-background-tabs-smart-toggle";
 const PARK_AGAIN_MENU_ID = "discard-background-tabs-park-again";
+const UNPARK_ALL_MENU_ID = "discard-background-tabs-unpark-all";
+const PARK_EXCEPT_CURRENT_MENU_ID = "discard-background-tabs-park-except-current";
 
 function isDiscardCandidate(tab) {
   if (!tab.id) return false;
@@ -21,7 +23,8 @@ function isDiscardCandidate(tab) {
   return !SKIPPED_URL_PREFIXES.some((prefix) => tab.url.startsWith(prefix));
 }
 
-async function parkActiveTabs() {
+async function parkActiveTabs(options = {}) {
+  const excludedTabId = options.excludedTabId || null;
   const parkedState = await getParkedState();
   const tabs = await chrome.tabs.query({});
   const activeTabsByWindow = new Map();
@@ -38,6 +41,8 @@ async function parkActiveTabs() {
     }
 
     if (tab.active) {
+      if (tab.id === excludedTabId) continue;
+
       activeTabsByWindow.set(tab.windowId, tab);
       if (tab.id && tab.url !== PARKED_PAGE) {
         previousActiveTabs[tab.windowId] = tab.id;
@@ -72,10 +77,28 @@ async function parkActiveTabs() {
 async function parkAndDiscardTabs() {
   await parkActiveTabs();
 
+  return discardEligibleTabs();
+}
+
+async function parkAndDiscardExceptCurrentTab() {
+  const [currentTab] = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true
+  });
+  const currentTabId = currentTab?.id || null;
+
+  await parkActiveTabs({ excludedTabId: currentTabId });
+
+  return discardEligibleTabs({ excludedTabId: currentTabId });
+}
+
+async function discardEligibleTabs(options = {}) {
+  const excludedTabId = options.excludedTabId || null;
   const tabs = await chrome.tabs.query({});
   let discardedCount = 0;
 
   for (const tab of tabs) {
+    if (tab.id === excludedTabId) continue;
     if (!isDiscardCandidate(tab)) continue;
 
     try {
@@ -169,7 +192,9 @@ async function restoreParkedWindows() {
 
 function createContextMenus() {
   chrome.contextMenus.removeAll(() => {
-    createActionMenu(SMART_TOGGLE_MENU_ID, "Discard background tabs", ["action"]);
+    createActionMenu(SMART_TOGGLE_MENU_ID, "Park all tabs", ["action"]);
+    createActionMenu(PARK_EXCEPT_CURRENT_MENU_ID, "Park all but current tab", ["action"]);
+    createActionMenu(UNPARK_ALL_MENU_ID, "Unpark all tabs", ["action"]);
     createActionMenu(PARK_AGAIN_MENU_ID, "Park again - discard tabs", ["action"]);
   });
 }
@@ -222,6 +247,10 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.contextMenus.onClicked.addListener((info) => {
   if (info.menuItemId === SMART_TOGGLE_MENU_ID) {
     smartToggleParking();
+  } else if (info.menuItemId === PARK_EXCEPT_CURRENT_MENU_ID) {
+    parkAndDiscardExceptCurrentTab();
+  } else if (info.menuItemId === UNPARK_ALL_MENU_ID) {
+    restoreParkedWindows();
   } else if (info.menuItemId === PARK_AGAIN_MENU_ID) {
     parkAndDiscardTabs();
   }
