@@ -13,6 +13,8 @@ const SMART_TOGGLE_MENU_ID = "discard-background-tabs-smart-toggle";
 const PARK_AGAIN_MENU_ID = "discard-background-tabs-park-again";
 const UNPARK_ALL_MENU_ID = "discard-background-tabs-unpark-all";
 const PARK_EXCEPT_CURRENT_MENU_ID = "discard-background-tabs-park-except-current";
+const HIBERNATE_THIS_TAB_MENU_ID = "discard-background-tabs-hibernate-this-tab";
+const UNPARK_THIS_TAB_MENU_ID = "discard-background-tabs-unpark-this-tab";
 
 function isDiscardCandidate(tab) {
   if (!tab.id) return false;
@@ -117,6 +119,83 @@ async function discardEligibleTabs(options = {}) {
   await chrome.alarms.create("clear-badge", { delayInMinutes: 0.05 });
 }
 
+async function hibernateSingleTab(tab) {
+  const targetTab = tab || (await getActiveTab());
+
+  if (!targetTab?.id || !targetTab.windowId) return;
+
+  if (!isDiscardCandidate(targetTab)) {
+    console.debug("Tab is not a discard candidate", targetTab.id, targetTab.url);
+    return;
+  }
+
+  // The active tab can't be discarded directly. Briefly switch focus to a
+  // neighboring real tab in the same window (no parked placeholder created),
+  // then discard this one in place. A background tab is discarded immediately.
+  if (targetTab.active) {
+    const neighbor = await findNeighborTab(targetTab);
+
+    if (!neighbor?.id) {
+      console.debug("No neighbor tab to focus before hibernating", targetTab.id);
+      return;
+    }
+
+    try {
+      await chrome.tabs.update(neighbor.id, { active: true });
+    } catch (error) {
+      console.debug("Could not focus neighbor tab", neighbor.id, error);
+      return;
+    }
+  }
+
+  try {
+    await chrome.tabs.discard(targetTab.id);
+  } catch (error) {
+    console.debug("Could not hibernate tab", targetTab.id, targetTab.url, error);
+  }
+}
+
+async function findNeighborTab(targetTab) {
+  const windowTabs = await chrome.tabs.query({ windowId: targetTab.windowId });
+  const candidates = windowTabs.filter(
+    (tab) => tab.id && tab.id !== targetTab.id && tab.url !== PARKED_PAGE
+  );
+
+  if (candidates.length === 0) return null;
+
+  // Prefer an already-loaded tab so we don't wake a discarded one just to focus.
+  return candidates.find((tab) => !tab.discarded) || candidates[0];
+}
+
+async function unparkSingleTab(tab) {
+  const targetTab = tab || (await getActiveTab());
+
+  if (!targetTab?.id || !targetTab.windowId) return;
+
+  // If this window is showing the parked placeholder, restore it. Otherwise
+  // just reload the discarded tab in place.
+  if (targetTab.url === PARKED_PAGE) {
+    return restoreParkedWindows({ windowId: targetTab.windowId });
+  }
+
+  if (!targetTab.discarded) return;
+
+  try {
+    await chrome.tabs.reload(targetTab.id);
+  } catch (error) {
+    console.debug("Could not unpark tab", targetTab.id, targetTab.url, error);
+  }
+}
+
+async function getActiveTab() {
+  const [activeTab] = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true
+  });
+
+  return activeTab || null;
+}
+
 async function getParkedState() {
   const result = await chrome.storage.session.get(PARKED_STATE_KEY);
   return result[PARKED_STATE_KEY] || null;
@@ -134,7 +213,8 @@ async function closeParkedTabs(parkedTabs) {
   }
 }
 
-async function restoreParkedWindows() {
+async function restoreParkedWindows(options = {}) {
+  const onlyWindowId = options.windowId || null;
   const parkedState = await getParkedState();
   const tabs = await chrome.tabs.query({});
   const tabsById = new Map();
@@ -146,15 +226,15 @@ async function restoreParkedWindows() {
       tabsById.set(tab.id, tab);
     }
 
-    if (tab.windowId) {
+    if (tab.windowId && (!onlyWindowId || tab.windowId === onlyWindowId)) {
       if (!tabsByWindow.has(tab.windowId)) {
         tabsByWindow.set(tab.windowId, []);
       }
       tabsByWindow.get(tab.windowId).push(tab);
-    }
 
-    if (tab.url === PARKED_PAGE) {
-      parkedTabs.push(tab);
+      if (tab.url === PARKED_PAGE) {
+        parkedTabs.push(tab);
+      }
     }
   }
 
@@ -184,7 +264,22 @@ async function restoreParkedWindows() {
   );
 
   await closeParkedTabs(removableParkedTabs);
-  await chrome.storage.session.remove(PARKED_STATE_KEY);
+
+  if (onlyWindowId) {
+    const previousActiveTabs = { ...(parkedState?.previousActiveTabs || {}) };
+    delete previousActiveTabs[onlyWindowId];
+
+    if (Object.keys(previousActiveTabs).length > 0) {
+      await chrome.storage.session.set({
+        [PARKED_STATE_KEY]: { ...parkedState, previousActiveTabs }
+      });
+    } else {
+      await chrome.storage.session.remove(PARKED_STATE_KEY);
+    }
+  } else {
+    await chrome.storage.session.remove(PARKED_STATE_KEY);
+  }
+
   await chrome.action.setBadgeBackgroundColor({ color: "#355c9a" });
   await chrome.action.setBadgeText({ text: "UP" });
   await chrome.alarms.create("clear-badge", { delayInMinutes: 0.05 });
@@ -196,6 +291,8 @@ function createContextMenus() {
     createActionMenu(PARK_EXCEPT_CURRENT_MENU_ID, "Park all but current tab", ["action"]);
     createActionMenu(UNPARK_ALL_MENU_ID, "Unpark all tabs", ["action"]);
     createActionMenu(PARK_AGAIN_MENU_ID, "Park again - discard tabs", ["action"]);
+    createActionMenu(HIBERNATE_THIS_TAB_MENU_ID, "Hibernate this tab", ["action"]);
+    createActionMenu(UNPARK_THIS_TAB_MENU_ID, "Unpark this tab", ["action"]);
   });
 }
 
@@ -209,8 +306,15 @@ function createActionMenu(id, title, contexts) {
     () => {
       const error = chrome.runtime.lastError;
 
-      if (error && contexts.includes("action")) {
-        createActionMenu(id, title, ["browser_action"]);
+      if (!error) return;
+
+      // Some Chromium builds use "browser_action" instead of "action".
+      const fallbackContexts = contexts.map((context) =>
+        context === "action" ? "browser_action" : context
+      );
+
+      if (fallbackContexts.some((context, index) => context !== contexts[index])) {
+        createActionMenu(id, title, fallbackContexts);
       }
     }
   );
@@ -244,7 +348,7 @@ chrome.runtime.onStartup.addListener(() => {
   createContextMenus();
 });
 
-chrome.contextMenus.onClicked.addListener((info) => {
+chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === SMART_TOGGLE_MENU_ID) {
     smartToggleParking();
   } else if (info.menuItemId === PARK_EXCEPT_CURRENT_MENU_ID) {
@@ -253,6 +357,10 @@ chrome.contextMenus.onClicked.addListener((info) => {
     restoreParkedWindows();
   } else if (info.menuItemId === PARK_AGAIN_MENU_ID) {
     parkAndDiscardTabs();
+  } else if (info.menuItemId === HIBERNATE_THIS_TAB_MENU_ID) {
+    hibernateSingleTab(tab);
+  } else if (info.menuItemId === UNPARK_THIS_TAB_MENU_ID) {
+    unparkSingleTab(tab);
   }
 });
 

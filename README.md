@@ -11,6 +11,8 @@ Discarding is Chromium's built-in tab hibernation mechanism: the tab remains in 
 - Right-click the extension button and choose **Park all but current tab** to keep the focused tab active while discarding every other eligible tab.
 - Right-click the extension button and choose **Unpark all tabs** to restore parked windows.
 - Right-click the extension button and choose **Park again - discard tabs** to re-run parking without restoring first.
+- Right-click the extension button and choose **Hibernate this tab** to discard just the current tab in place, without creating a parked placeholder. Focus briefly moves to a neighboring tab so the active tab can be discarded.
+- Right-click the extension button and choose **Unpark this tab** to restore only the current window from its parked state.
 - Falls back to another real tab in the same window if the previously active tab no longer exists.
 - Discards tabs across all browser windows, including the previously active tab in the current window.
 - Skips pinned tabs.
