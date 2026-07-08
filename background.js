@@ -15,10 +15,24 @@ const UNPARK_ALL_MENU_ID = "discard-background-tabs-unpark-all";
 const PARK_EXCEPT_CURRENT_MENU_ID = "discard-background-tabs-park-except-current";
 const HIBERNATE_THIS_TAB_MENU_ID = "discard-background-tabs-hibernate-this-tab";
 const UNPARK_THIS_TAB_MENU_ID = "discard-background-tabs-unpark-this-tab";
+const PARK_PINNED_SEPARATOR_ID = "discard-background-tabs-park-pinned-separator";
+const PARK_PINNED_MENU_ID = "discard-background-tabs-toggle-park-pinned";
+const PARK_PINNED_STORAGE_KEY = "parkPinnedTabs";
+const PARK_PINNED_DEFAULTS = { [PARK_PINNED_STORAGE_KEY]: true };
 
-function isDiscardCandidate(tab) {
+async function getParkPinnedEnabled() {
+  const stored = await chrome.storage.local.get(PARK_PINNED_DEFAULTS);
+  return stored[PARK_PINNED_STORAGE_KEY] !== false;
+}
+
+async function setParkPinnedEnabled(enabled) {
+  await chrome.storage.local.set({ [PARK_PINNED_STORAGE_KEY]: enabled });
+}
+
+function isDiscardCandidate(tab, options = {}) {
   if (!tab.id) return false;
-  if (tab.discarded || tab.pinned || tab.audible) return false;
+  if (tab.discarded || tab.audible) return false;
+  if (tab.pinned && !options.parkPinned) return false;
   if (!tab.url) return false;
   if (tab.url === PARKED_PAGE) return false;
 
@@ -96,12 +110,13 @@ async function parkAndDiscardExceptCurrentTab() {
 
 async function discardEligibleTabs(options = {}) {
   const excludedTabId = options.excludedTabId || null;
+  const parkPinned = await getParkPinnedEnabled();
   const tabs = await chrome.tabs.query({});
   let discardedCount = 0;
 
   for (const tab of tabs) {
     if (tab.id === excludedTabId) continue;
-    if (!isDiscardCandidate(tab)) continue;
+    if (!isDiscardCandidate(tab, { parkPinned })) continue;
 
     try {
       await chrome.tabs.discard(tab.id);
@@ -124,7 +139,8 @@ async function hibernateSingleTab(tab) {
 
   if (!targetTab?.id || !targetTab.windowId) return;
 
-  if (!isDiscardCandidate(targetTab)) {
+  const parkPinned = await getParkPinnedEnabled();
+  if (!isDiscardCandidate(targetTab, { parkPinned })) {
     console.debug("Tab is not a discard candidate", targetTab.id, targetTab.url);
     return;
   }
@@ -286,23 +302,34 @@ async function restoreParkedWindows(options = {}) {
 }
 
 function createContextMenus() {
-  chrome.contextMenus.removeAll(() => {
+  chrome.contextMenus.removeAll(async () => {
     createActionMenu(SMART_TOGGLE_MENU_ID, "Park all tabs", ["action"]);
     createActionMenu(PARK_EXCEPT_CURRENT_MENU_ID, "Park all but current tab", ["action"]);
     createActionMenu(UNPARK_ALL_MENU_ID, "Unpark all tabs", ["action"]);
     createActionMenu(PARK_AGAIN_MENU_ID, "Park again - discard tabs", ["action"]);
     createActionMenu(HIBERNATE_THIS_TAB_MENU_ID, "Hibernate this tab", ["action"]);
     createActionMenu(UNPARK_THIS_TAB_MENU_ID, "Unpark this tab", ["action"]);
+    createSeparatorMenu(PARK_PINNED_SEPARATOR_ID, ["action"]);
+    const parkPinned = await getParkPinnedEnabled();
+    createCheckboxMenu(PARK_PINNED_MENU_ID, "Park pinned tabs", parkPinned, ["action"]);
   });
 }
 
 function createActionMenu(id, title, contexts) {
+  createMenuItem({ id, title }, contexts);
+}
+
+function createSeparatorMenu(id, contexts) {
+  createMenuItem({ id, type: "separator" }, contexts);
+}
+
+function createCheckboxMenu(id, title, checked, contexts) {
+  createMenuItem({ id, title, type: "checkbox", checked }, contexts);
+}
+
+function createMenuItem(props, contexts) {
   chrome.contextMenus.create(
-    {
-      id,
-      title,
-      contexts
-    },
+    { ...props, contexts },
     () => {
       const error = chrome.runtime.lastError;
 
@@ -314,7 +341,7 @@ function createActionMenu(id, title, contexts) {
       );
 
       if (fallbackContexts.some((context, index) => context !== contexts[index])) {
-        createActionMenu(id, title, fallbackContexts);
+        createMenuItem(props, fallbackContexts);
       }
     }
   );
@@ -361,6 +388,8 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     hibernateSingleTab(tab);
   } else if (info.menuItemId === UNPARK_THIS_TAB_MENU_ID) {
     unparkSingleTab(tab);
+  } else if (info.menuItemId === PARK_PINNED_MENU_ID) {
+    setParkPinnedEnabled(info.checked);
   }
 });
 
